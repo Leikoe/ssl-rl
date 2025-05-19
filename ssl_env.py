@@ -1,152 +1,178 @@
 import time
-from typing import List, NamedTuple, Optional, Tuple
+from typing import NamedTuple, Callable
 import numpy as np
 import jax
 from jax import numpy as jnp
 import mujoco
 from mujoco import mjx
 
-
 # mujoco consts
 _MJ_MODEL = mujoco.MjModel.from_xml_path("scene.xml")
 _MJX_MODEL = mjx.put_model(_MJ_MODEL)
 ROBOT_QPOS_ADRS = jnp.array([_MJ_MODEL.joint("x_pos").qposadr[0], _MJ_MODEL.joint("y_pos").qposadr[0], _MJ_MODEL.joint("orientation").qposadr[0]]) # (x, y, orienation)
 ROBOT_QVEL_ADRS = jnp.array([_MJ_MODEL.joint("x_pos").dofadr[0], _MJ_MODEL.joint("y_pos").dofadr[0], _MJ_MODEL.joint("orientation").dofadr[0]])  # (vx, vy, vangular)
-ROBOT_CTRL_ADRS = jnp.array([_MJ_MODEL.actuator("forward_motor").id, _MJ_MODEL.actuator("left_motor").id, _MJ_MODEL.actuator("orientation_motor").id])  # (x, y, angular) motors
+ROBOT_CTRL_ADRS = jnp.array([_MJ_MODEL.actuator("forward_motor").id, _MJ_MODEL.actuator("left_motor").id, _MJ_MODEL.actuator("orientation_motor").id])  # (fx, fy, fangular) motors
 BALL_QPOS_ADRS = jnp.arange(3) + _MJ_MODEL.joint("free_ball").qposadr[0]  # (x, y, z) pos
 BALL_QVEL_ADRS = jnp.arange(6) + _MJ_MODEL.joint("free_ball").dofadr[0]  # linear speed, rotational speed
-
-# ctrl consts
-A_MAX = 5.
-K = 4.
 M = _MJ_MODEL.body("robot_base").mass
 
 # temp goal
 TARGET_POS = jnp.array([3, 2.])
 
-class Env(NamedTuple):
-    mjx_data: mjx.Data
-    reward: float
-
-class Observation(NamedTuple):
-    pos: jax.Array  # (x, y)
-    orientation: jax.Array  # (orientation,) angle in radians
-    vel: jax.Array  # (vx, vy)
-    angular_vel: jax.Array  # (angular_vel,) radians/s
-    ball_pos: jax.Array  # (x, y, z)
-    ball_vel: jax.Array  # (vx, vy, vz)
 
 class Action(NamedTuple):
     target_vel: jax.Array
     kick: bool
 
+class Observation(NamedTuple):
+    pos: jax.Array  # (x, y)
+    vel: jax.Array  # (vx, vy)
+    orientation: jax.Array  # (orientation,) angle in radians
+    angular_vel: jax.Array  # (angular_vel,) radians/s
+    ball_pos: jax.Array  # (x, y, z)
+    ball_vel: jax.Array  # (vx, vy, vz)
 
-def _get_obs(mjx_data: mjx.Data) -> Observation:
-    return Observation(
-        pos = mjx_data.qpos[ROBOT_QPOS_ADRS][:2],
-        orientation = mjx_data.qpos[ROBOT_QPOS_ADRS][2],
-        vel = mjx_data.qvel[ROBOT_QVEL_ADRS][:2],
-        angular_vel = mjx_data.qvel[ROBOT_QVEL_ADRS][2],
-        ball_pos = mjx_data.qpos[BALL_QPOS_ADRS][:3],
-        ball_vel = mjx_data.qvel[BALL_QVEL_ADRS][:3]
-    )
+class State(NamedTuple):
+    mjx_data: mjx.Data
+    observation: Observation
+    reward: float
+    terminated: bool
 
-def new_env(key: Optional[jax.Array]) -> tuple[Env, Observation]:
-    mjx_data = mjx.make_data(_MJX_MODEL)
-    # init code here ...
-    mjx_data = mjx_data.replace(qvel=mjx_data.qvel.at[BALL_QVEL_ADRS[0]].set(-1.)) # TODO: fix kick orientation
-    if key is not None:
-        pos = jax.random.uniform(key, (2,), float, jnp.array([-4., -3.]), jnp.array([-0.2, 3.]))
-        mjx_data = mjx_data.replace(qpos=mjx_data.qpos.at[ROBOT_QPOS_ADRS[:2]].set(pos))
-    obs = _get_obs(mjx_data)
-    return Env(mjx_data=mjx_data, reward=jnp.linalg.norm(TARGET_POS - obs.pos)), obs
 
-def step_env(env: Env, action: Action) -> tuple[Env, Observation, float, bool]:
-    """
-    Steps the env using the given `action`.
+class Ssl():
+    def __init__(self, max_accel=5., k=4.):
+        """
+        Initializes a Ssl env factory.
+        """
 
-    Args:
-        env (Env): The env state to step.
-        action (Action): The action to take.
+        self.max_accel: float = max_accel
+        self.k: float = k
 
-    Returns:
-        Env: The new env state.
-        Observation: The observation of the new env state.
-        float: The reward.
-        bool: terminated (reached a final pos, good or bad).
-        bool: truncated (was forcefully terminated).
-    """
-    mjx_data = env.mjx_data
-    new_qvel = mjx_data.qvel
+    def init(self, key: jax.Array) -> State:
+        mjx_data = mjx.make_data(_MJX_MODEL)
+        # init code here ...
+        mjx_data = mjx_data.replace(qvel=mjx_data.qvel.at[BALL_QVEL_ADRS[0]].set(-1.)) # TODO: fix kick orientation
+        if key is not None:
+            pos = jax.random.uniform(key, (2,), float, jnp.array([-4., -3.]), jnp.array([-0.2, 3.]))
+            mjx_data = mjx_data.replace(qpos=mjx_data.qpos.at[ROBOT_QPOS_ADRS[:2]].set(pos))
 
-    # kick
-    robot_pos = mjx_data.qpos[ROBOT_QPOS_ADRS][:2]
-    ball_pos = mjx_data.qpos[BALL_QPOS_ADRS][:2]
+        obs = self._get_obs(mjx_data)
+        return State(mjx_data=mjx_data, observation=obs, reward=jnp.linalg.norm(TARGET_POS - obs.pos), terminated=False)
 
-    robot_to_ball = ball_pos-robot_pos
-    robot_to_ball_angle = jnp.arctan2(robot_to_ball[1], robot_to_ball[0])
-    robot_to_ball_distance = jnp.linalg.norm(robot_to_ball)
-    robot_to_ball_normalized = robot_to_ball / robot_to_ball_distance
 
-    REACH = 0.09 + 0.025  # robot radius + ball radius
-    kick_would_hit_ball = (robot_to_ball_distance < REACH) & ((robot_to_ball_angle < 0.2) & (robot_to_ball_angle > -0.2))
-    new_qvel = jax.lax.select(
-        jnp.logical_and(action.kick, kick_would_hit_ball),  # if we want to kick and the kick can hit the ball, apply vel
-        new_qvel.at[BALL_QVEL_ADRS[:2]].set(robot_to_ball_normalized * 5.),
-        new_qvel
-    )
-    mjx_data = mjx_data.replace(qvel=new_qvel)
+    def step(self, state: State, action: Action, key: jax.Array) -> State:
+        """
+        Steps the env using the given `action`.
 
-    vel = mjx_data.qvel[ROBOT_QVEL_ADRS][:2]
+        Args:
+            state: The env state to step.
+            action: The action to take.
+            key: The key used for randomness within the step
 
-    target_vel = action.target_vel # for now
-    vel_err = target_vel - vel
+        Returns:
+            Env: The new env state.
+            Observation: The observation of the new env state.
+            float: The reward.
+            bool: terminated (reached a final pos, good or bad).
+            # bool: truncated (was forcefully terminated).
+        """
+        del key
+        mjx_data = state.mjx_data
+        new_qvel = mjx_data.qvel
 
-    # clip speed
-    a_target = K*vel_err
-    a_target_norm = jnp.linalg.norm(a_target)
-    a_target = jax.lax.select(jnp.linalg.norm(a_target) > A_MAX, a_target * (A_MAX / a_target_norm), a_target)
 
-    # compute force
-    f = M * a_target
+        # kick
+        robot_pos = mjx_data.qpos[ROBOT_QPOS_ADRS][:2]
+        ball_pos = mjx_data.qpos[BALL_QPOS_ADRS][:2]
 
-    mjx_data = mjx_data.replace(ctrl=mjx_data.ctrl.at[ROBOT_CTRL_ADRS[:2]].set(f))
-    mjx_data = mjx.step(_MJX_MODEL, mjx_data)
-    obs = _get_obs(mjx_data)
-    reward = -jnp.linalg.norm(TARGET_POS - obs.pos)
-    return Env(mjx_data, reward), obs, reward, False
+        robot_to_ball = ball_pos-robot_pos
+        robot_to_ball_angle = jnp.arctan2(robot_to_ball[1], robot_to_ball[0])
+        robot_to_ball_distance = jnp.linalg.norm(robot_to_ball)
+        robot_to_ball_normalized = robot_to_ball / robot_to_ball_distance
+
+        REACH = 0.09 + 0.025  # robot radius + ball radius
+        kick_would_hit_ball = (robot_to_ball_distance < REACH) & ((robot_to_ball_angle < 0.2) & (robot_to_ball_angle > -0.2))
+        new_qvel = jax.lax.select(
+            jnp.logical_and(action.kick, kick_would_hit_ball),  # if we want to kick and the kick can hit the ball, apply vel
+            new_qvel.at[BALL_QVEL_ADRS[:2]].set(robot_to_ball_normalized * 5.),
+            new_qvel
+        )
+        mjx_data = mjx_data.replace(qvel=new_qvel)
+
+        vel = mjx_data.qvel[ROBOT_QVEL_ADRS][:2]
+
+        target_vel = action.target_vel # for now
+        vel_err = target_vel - vel
+
+        # clip speed
+        a_target = self.k*vel_err
+        a_target_norm = jnp.linalg.norm(a_target)
+        a_target = jax.lax.select(jnp.linalg.norm(a_target) > self.max_accel, a_target * (self.max_accel / a_target_norm), a_target)
+
+        # compute force
+        f = M * a_target
+
+        print(state.observation.pos.shape)
+        mjx_data = mjx_data.replace(ctrl=mjx_data.ctrl.at[ROBOT_CTRL_ADRS[:2]].set(f))
+        mjx_data = mjx.step(_MJX_MODEL, mjx_data)
+        obs = self._get_obs(mjx_data)
+        reward = -jnp.linalg.norm(TARGET_POS - obs.pos)
+        return State(mjx_data=mjx_data, observation=obs, reward=reward, terminated=False)
+        # return State(mjx_data=mjx_data, observation=state.observation, reward=state.reward, terminated=state.terminated)
+
+    def _get_obs(self, mjx_data: mjx.Data) -> Observation:
+        return Observation(
+            pos = mjx_data.qpos[ROBOT_QPOS_ADRS][:2],
+            orientation = mjx_data.qpos[ROBOT_QPOS_ADRS][2],
+            vel = mjx_data.qvel[ROBOT_QVEL_ADRS][:2],
+            angular_vel = mjx_data.qvel[ROBOT_QVEL_ADRS][2],
+            ball_pos = mjx_data.qpos[BALL_QPOS_ADRS][:3],
+            ball_vel = mjx_data.qvel[BALL_QVEL_ADRS][:3]
+        )
+
 
 if __name__ == "__main__":
-    env, _ = new_env(200, None)
-    mj_data = mjx.get_data(_MJ_MODEL, env.mjx_data)
+    N_ENVS = 4
 
-    jitted_step_env = jax.jit(step_env)
+    key = jax.random.key(0)
+
+    ssl = Ssl()
+    jitted_vmapped_init = jax.jit(jax.vmap(ssl.init))
+    jitted_vmapped_step = jax.jit(jax.vmap(ssl.step))
+
+    envs: State = jitted_vmapped_init(jax.random.split(key, N_ENVS))
+
+    mj_datas: list[mujoco.MjData] = mjx.get_data(_MJ_MODEL, envs.mjx_data)
 
     duration = 2.  # (seconds)
     framerate = 25  # (Hz)
 
     frames = []
     renderer = mujoco.Renderer(_MJ_MODEL, width=720, height=480)
-    while env.mjx_data.time < duration:
+    while mj_datas[0].time < duration:
         print(f"step {len(frames)}")
         step_start = time.time()
 
-        robot_pos = env.mjx_data.qpos[ROBOT_QPOS_ADRS][:2]
-        ball_pos = env.mjx_data.qpos[BALL_QPOS_ADRS][:2]
+        robots_xy = envs.observation.pos
+        balls_xy = envs.observation.ball_pos[:, :2]
 
-        robot_to_ball = ball_pos-robot_pos
-        robot_to_ball_angle = jnp.arctan2(robot_to_ball[1], robot_to_ball[0])
-        robot_to_ball_distance = np.linalg.norm(robot_to_ball)
-        kick = bool(robot_to_ball_distance < (0.09 + 0.025))
+        robot_to_ball = balls_xy-robots_xy
+        robot_to_ball_angle = jnp.arctan2(robot_to_ball[:, 1], robot_to_ball[:, 0])
+        robot_to_ball_distance = jax.vmap(jnp.linalg.norm)(robot_to_ball)
 
-        target_vel = jnp.array([1., 0.]) # placeholder for policy output
-        action = Action(target_vel, kick)
+        kick = robot_to_ball_distance < (0.09 + 0.025)
 
-        env, obs, reward, _ = jitted_step_env(env, action)
-        print(obs, reward)
-        if len(frames) < env.mjx_data.time * framerate:
-            mj_data = mjx.get_data(_MJ_MODEL, env.mjx_data)
-            renderer.update_scene(mj_data)
+        target_vels = jnp.array([[1., 0.]], dtype=jnp.float32).repeat(N_ENVS, axis=0) # placeholder for policy output
+        print(target_vels)
+        actions = Action(target_vels, kick)
+
+        print(actions.target_vel.shape, actions.kick.shape)
+
+        envs: State = jitted_vmapped_step(envs, actions, None) #jax.random.split(key, N_ENVS))
+        print(envs.observation, envs.reward)
+        if len(frames) < mj_datas[0].time * framerate:
+            mj_datas = mjx.get_data(_MJ_MODEL, envs.mjx_data)
+            renderer.update_scene(mj_datas)
             pixels = renderer.render()
             frames.append(pixels)
     renderer.close()
