@@ -11,6 +11,8 @@ from flax.nnx.nn.initializers import constant, orthogonal
 from gymnax.environments import spaces
 from jax.sharding import PartitionSpec as P
 
+import ssl_env_gymnax
+
 print(jax.local_devices())
 NUM_DEVICES = jax.local_device_count()
 
@@ -39,7 +41,8 @@ assert NUM_ENVS % NUM_DEVICES == 0, (
 )
 NUM_ENVS_PER_DEVICE = NUM_ENVS // NUM_DEVICES
 
-env, env_params = gymnax.make(ENV_NAME)
+# env, env_params = gymnax.make(ENV_NAME)
+env, env_params = ssl_env_gymnax.SslEnv(), ssl_env_gymnax.EnvParams()
 vmap_reset = jax.vmap(env.reset, in_axes=(0, None))
 vmap_step = jax.vmap(env.step, in_axes=(0, 0, 0, None))
 
