@@ -8,6 +8,7 @@ import numpy as np
 import optax
 from flax import nnx
 from flax.nnx.nn.initializers import constant, orthogonal
+from gymnax.environments import spaces
 from jax.sharding import PartitionSpec as P
 
 print(jax.local_devices())
@@ -27,13 +28,15 @@ EPS = 0.1
 DISCOUNT_FACTOR = 0.99
 GAE_LAMBDA = 0.95
 
-ENV_NAME = "CartPole-v1"
+ENV_NAME = "Pendulum-v1"
 OPTIMIZER = optax.chain(
     optax.clip_by_global_norm(0.5),
     optax.adamw(1e-3),
 )
 
-assert NUM_ENVS % NUM_DEVICES == 0, "for parallel experience collection, NUM_ENVS should be divisible by NUM_DEVICES!"
+assert NUM_ENVS % NUM_DEVICES == 0, (
+    "for parallel experience collection, NUM_ENVS should be divisible by NUM_DEVICES!"
+)
 NUM_ENVS_PER_DEVICE = NUM_ENVS // NUM_DEVICES
 
 env, env_params = gymnax.make(ENV_NAME)
@@ -46,10 +49,12 @@ class Model(nnx.Module):
         self,
         input_dim,
         hidden_dim,
-        num_actions,
+        action_dim,
+        continuous=False,
         dropout=0.1,
         rngs: nnx.Rngs = nnx.Rngs(0),
     ):
+        self.continuous = continuous
         self.policy = nnx.Sequential(
             nnx.Linear(
                 input_dim,
@@ -71,7 +76,7 @@ class Model(nnx.Module):
             nnx.relu,
             nnx.Linear(
                 hidden_dim,
-                num_actions,
+                action_dim,
                 rngs=rngs,
                 kernel_init=orthogonal(0.01),
                 bias_init=constant(0.0),
@@ -104,13 +109,21 @@ class Model(nnx.Module):
                 bias_init=constant(0.0),
             ),
         )
+        if self.continuous:
+            self.log_std = nnx.Param(jnp.zeros((action_dim,)))
 
-    def __call__(self, x: jax.Array) -> tuple[distrax.Categorical, jax.Array]:
+    def __call__(self, x: jax.Array) -> tuple[distrax.Distribution, jax.Array]:
         logits = self.policy(x)
+        if self.continuous:
+            return distrax.MultivariateNormalDiag(
+                logits, jnp.exp(self.log_std.value)
+            ), self.value(x)
         return distrax.Categorical(logits), self.value(x)
 
 
-def get_action_logprobs_value(model: Model, obs: jax.Array, key: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+def get_action_logprobs_value(
+    model: Model, obs: jax.Array, key: jax.Array
+) -> tuple[jax.Array, jax.Array, jax.Array]:
     pi, value = model(obs)
     action = pi.sample(seed=key)
     return action, pi.log_prob(action), value
@@ -125,13 +138,19 @@ def get_action(model: Model, obs: jax.Array, key: jax.Array) -> jax.Array:
     return model(obs)[0].sample(seed=key)
 
 
-def loss_fn(model, observations, actions, values, actions_log_probs, advantages, returns):
-    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)  # standardize advantages
+def loss_fn(
+    model, observations, actions, values, actions_log_probs, advantages, returns
+):
+    advantages = (advantages - advantages.mean()) / (
+        advantages.std() + 1e-8
+    )  # standardize advantages
 
     pi, value = model(observations)
     value = value.flatten()
 
-    prob_ratio = jnp.exp(pi.log_prob(actions) - actions_log_probs)  # = p_new(a_t) / p_old(a_t) because of log rules log(a/b) = log(a) - log(b)
+    prob_ratio = jnp.exp(
+        pi.log_prob(actions) - actions_log_probs
+    )  # = p_new(a_t) / p_old(a_t) because of log rules log(a/b) = log(a) - log(b)
 
     policy_loss = -jnp.mean(
         jnp.minimum(
@@ -179,7 +198,9 @@ def step_once(carry, _):
     action, log_prob, value = get_action_logprobs_value(model, last_observation, subkey)
 
     # Automatic env resetting in gymnax step!
-    observation, env_state, reward, done, _ = vmap_step(jax.random.split(subkey, NUM_ENVS_PER_DEVICE), env_state, action, env_params)
+    observation, env_state, reward, done, _ = vmap_step(
+        jax.random.split(subkey, NUM_ENVS_PER_DEVICE), env_state, action, env_params
+    )
 
     return (key, model_state, env_state, observation), (
         last_observation,
@@ -191,14 +212,26 @@ def step_once(carry, _):
     )
 
 
-@partial(jax.shard_map, mesh=mesh, in_specs=(P("x"), None), out_specs=(P("x"), P("x")), check_vma=False)
+@partial(
+    jax.shard_map,
+    mesh=mesh,
+    in_specs=(P("x"), None),
+    out_specs=(P("x"), P("x")),
+    check_vma=False,
+)
 def collect_experience(keys, model_state):
     key = keys[0]  # keys was (1,)
-    observation, env_state = vmap_reset(jax.random.split(key, NUM_ENVS_PER_DEVICE), env_params)
+    observation, env_state = vmap_reset(
+        jax.random.split(key, NUM_ENVS_PER_DEVICE), env_params
+    )
     env_state = jax.lax.pvary(env_state, "x")
 
-    (key, _, _, last_observation), trajectory = jax.lax.scan(step_once, (key, model_state, env_state, observation), length=NUM_STEPS)
-    return last_observation, jax.tree.map(lambda x: x.swapaxes(0, 1), trajectory)  # (NUM_ENVS_PER_DEVICE,), (NUM_ENVS_PER_DEVICE, NUM_STEPS, *)
+    (key, _, _, last_observation), trajectory = jax.lax.scan(
+        step_once, (key, model_state, env_state, observation), length=NUM_STEPS
+    )
+    return last_observation, jax.tree.map(
+        lambda x: x.swapaxes(0, 1), trajectory
+    )  # (NUM_ENVS_PER_DEVICE,), (NUM_ENVS_PER_DEVICE, NUM_STEPS, *)
 
 
 def iter_once(carry, i):
@@ -212,13 +245,21 @@ def iter_once(carry, i):
         per_device_key, model_state
     )  # (NUM_DEVICES * NUM_ENVS_PER_DEVICE,), (NUM_DEVICES * NUM_ENVS_PER_DEVICE, NUM_STEPS, *)
 
-    trajectory = jax.tree.map(lambda x: x.swapaxes(0, 1), trajectory)  # (NUM_STEPS, NUM_ENVS, *)
-    observations, values, actions, log_probs, rewards, dones = trajectory  # (NUM_STEPS, NUM_ENVS, *)
+    trajectory = jax.tree.map(
+        lambda x: x.swapaxes(0, 1), trajectory
+    )  # (NUM_STEPS, NUM_ENVS, *)
+    observations, values, actions, log_probs, rewards, dones = (
+        trajectory  # (NUM_STEPS, NUM_ENVS, *)
+    )
 
-    last_value = get_value(nnx.merge(*model_state), last_observation).flatten()  # one more required for gae's deltas
+    last_value = get_value(
+        nnx.merge(*model_state), last_observation
+    ).flatten()  # one more required for gae's deltas
 
     # Compute advantage estimates Â_1,..., Â_T
-    advantages, returns = calculate_gae_returns(rewards, values, dones, last_value)  # (T, N)
+    advantages, returns = calculate_gae_returns(
+        rewards, values, dones, last_value
+    )  # (T, N)
 
     # flatten NUM_ENVS * NUM_STEPS of experience
     (
@@ -231,7 +272,9 @@ def iter_once(carry, i):
         advantages,
         returns,
     ) = jax.tree.map(
-        lambda x: x.flatten() if len(x.shape) == 2 else x.reshape(NUM_STEPS * NUM_ENVS, -1),
+        lambda x: x.flatten()
+        if len(x.shape) == 2
+        else x.reshape(NUM_STEPS * NUM_ENVS, -1),
         (*trajectory, advantages, returns),
     )  # (NUM_ENVS * NUM_STEPS, *)
 
@@ -262,27 +305,41 @@ def iter_once(carry, i):
 
             # pure optax update
             current_params = nnx.state(model, nnx.Param)
-            updates, optimizer_state = OPTIMIZER.update(grads, optimizer_state, current_params)
+            updates, optimizer_state = OPTIMIZER.update(
+                grads, optimizer_state, current_params
+            )
             new_params = optax.apply_updates(current_params, updates)
             nnx.update(model, new_params)
 
             return (nnx.split(model), optimizer_state), None
 
-        (model_state, optimizer_state), _ = jax.lax.scan(one_batch, (model_state, optimizer_state), batches_idxs)
+        (model_state, optimizer_state), _ = jax.lax.scan(
+            one_batch, (model_state, optimizer_state), batches_idxs
+        )
 
         return (key, model_state, optimizer_state), None
 
-    (key, model_state, optimizer_state), _ = jax.lax.scan(one_epoch, (key, model_state, optimizer_state), jnp.arange(K))
+    (key, model_state, optimizer_state), _ = jax.lax.scan(
+        one_epoch, (key, model_state, optimizer_state), jnp.arange(K)
+    )
     return (key, model_state, optimizer_state), None
 
 
 if __name__ == "__main__":
     key = jax.random.key(SEED)
+
+    action_space = env.action_space(env_params)
+    continuous = isinstance(action_space, spaces.Box)
     model = Model(
-        env.observation_space(env_params).shape[0], 128, env.action_space(env_params).n
-    )  # Acrobot has obs (6,) and action (1,) in [0,3] range
+        env.observation_space(env_params).shape[0],
+        128,
+        action_space.shape[0] if continuous else action_space.n,
+        continuous=continuous,
+    )
     optimizer_state = OPTIMIZER.init(nnx.state(model, nnx.Param))
-    (key, model_state, optimizer_state), _ = jax.lax.scan(iter_once, (key, nnx.split(model), optimizer_state), jnp.arange(ITERATIONS))
+    (key, model_state, optimizer_state), _ = jax.lax.scan(
+        iter_once, (key, nnx.split(model), optimizer_state), jnp.arange(ITERATIONS)
+    )
     model = nnx.merge(*model_state)
 
     # EVAL
@@ -292,10 +349,9 @@ if __name__ == "__main__":
     observation, _ = env.reset(seed=42)
     for _ in range(1000):
         key, subkey = jax.random.split(key)
-        action = get_action(model, observation, subkey).item()
+        action = np.array(get_action(model, observation, subkey))
         observation, reward, terminated, truncated, _ = env.step(action)
         if terminated or truncated:
             observation, _ = env.reset()
 
     env.close()
-
