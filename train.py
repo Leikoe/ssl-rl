@@ -21,7 +21,7 @@ mesh = jax.make_mesh((NUM_DEVICES,), ("x",))
 SEED = 7
 ITERATIONS = 50
 NUM_STEPS = 1024
-NUM_ENVS = 2048
+NUM_ENVS = 1024
 VALUE_COEF = 0.5
 ENTROPY_COEF = 0.001
 BATCH_SIZE = 4096
@@ -240,7 +240,8 @@ def collect_experience(keys, model_state):
 def iter_once(carry, i):
     key, model_state, optimizer_state = carry
     key, subkey = jax.random.split(key)
-    jax.debug.print("iteration {i}", i=i)
+
+    jax.debug.print("iteration {i} (viewed {n} steps)", i=i, n=i * NUM_ENVS * NUM_STEPS)
 
     # Run policy πθold in environment for T timesteps
     per_device_key = jax.random.split(subkey, NUM_DEVICES)
@@ -286,7 +287,10 @@ def iter_once(carry, i):
     # Optimize surrogate L wrt θ, with K epochs and minibatch size M ≤NT
     def one_epoch(carry, epoch):
         key, model_state, optimizer_state = carry
-        jax.debug.print("epoch {epoch}", epoch=epoch)
+        jax.debug.print(
+            "epoch {epoch}",
+            epoch=epoch,
+        )
 
         key, subkey = jax.random.split(key)
         idxs = jax.random.permutation(subkey, NUM_ENVS * NUM_STEPS)

@@ -43,7 +43,7 @@ TARGET_POS = jnp.array([3.0, 2.0])
 class EnvParams(environment.EnvParams):
     max_accel: float = 5.0
     k: float = 4.0
-    max_steps_in_episode: int = 1000
+    max_steps_in_episode: int = 200
 
 
 @struct.dataclass
